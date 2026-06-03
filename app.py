@@ -2,7 +2,10 @@ import os
 import requests
 import tempfile
 from flask import Flask, request, jsonify
-from moviepy.editor import VideoFileClip, AudioFileClip, concatenate_videoclips
+try:
+    from moviepy.editor import VideoFileClip, AudioFileClip, concatenate_videoclips
+except ImportError:
+    from moviepy import VideoFileClip, AudioFileClip, concatenate_videoclips
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from googleapiclient.discovery import build
