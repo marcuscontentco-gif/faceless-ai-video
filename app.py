@@ -5,7 +5,6 @@ import tempfile
 import threading
 
 # ── CRITICAL: set FFMPEG_BINARY env var BEFORE importing moviepy ─────────────
-# moviepy.config reads this at module-load time via os.getenv()
 try:
     import imageio_ffmpeg as _iio_ff
     os.environ["FFMPEG_BINARY"] = _iio_ff.get_ffmpeg_exe()
@@ -31,10 +30,12 @@ YOUTUBE_REFRESH_TOKEN = os.environ.get('YOUTUBE_REFRESH_TOKEN')
 OUTPUT_WIDTH  = 1280
 OUTPUT_HEIGHT = 720
 
+
 def get_ffmpeg():
-    """Return path to the imageio-ffmpeg binary (modern, reliable)."""
+    """Return path to the imageio-ffmpeg binary."""
     import imageio_ffmpeg
     return imageio_ffmpeg.get_ffmpeg_exe()
+
 
 def download_file(url, output_path):
     response = requests.get(url, stream=True, timeout=120)
@@ -42,6 +43,7 @@ def download_file(url, output_path):
     with open(output_path, 'wb') as f:
         for chunk in response.iter_content(chunk_size=8192):
             f.write(chunk)
+
 
 def get_pexels_clips(keywords):
     headers = {'Authorization': PEXELS_API_KEY}
@@ -69,11 +71,12 @@ def get_pexels_clips(keywords):
             print(f"[Pexels] Error for '{keyword}': {e}")
     return all_clips
 
-def get_audio_duration(audio_path):
-    """Get audio duration in seconds using ffmpeg."""
+
+def get_media_duration(path):
+    """Get duration in seconds of any audio or video file using ffmpeg."""
     ffmpeg = get_ffmpeg()
     result = subprocess.run(
-        [ffmpeg, '-i', audio_path],
+        [ffmpeg, '-i', path],
         stderr=subprocess.PIPE, stdout=subprocess.PIPE, text=True
     )
     for line in result.stderr.split('\n'):
@@ -86,57 +89,110 @@ def get_audio_duration(audio_path):
                 pass
     return 60.0  # fallback
 
+
 def assemble_video(audio_path, clip_paths, output_path):
     """
-    Pure FFMPEG subprocess video assembly — bypasses MoviePy/imageio entirely.
-    Uses imageio_ffmpeg's modern bundled binary so any codec works.
+    Two-step FFMPEG assembly:
+      1. Normalize each raw Pexels clip to identical codec/resolution/fps
+         so the concat demuxer never freezes on a format mismatch.
+      2. Loop the normalized clips to cover the voiceover length, mux audio.
     """
     ffmpeg   = get_ffmpeg()
-    duration = get_audio_duration(audio_path)
+    duration = get_media_duration(audio_path)
     print(f"[Assemble] Audio duration: {duration:.1f}s, clips available: {len(clip_paths)}")
 
     with tempfile.TemporaryDirectory() as work_dir:
-        # Build a concat list — repeat clips until we have ~2x the audio duration
+
+        # ── Step 1: normalize every clip ────────────────────────────────────
+        normalized_paths    = []
+        normalized_durations = []
+
+        for i, clip_path in enumerate(clip_paths):
+            norm_path = os.path.join(work_dir, f'norm_{i:02d}.mp4')
+            norm_cmd  = [
+                ffmpeg, '-y',
+                '-i', clip_path,
+                '-vf', (
+                    f'scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}'
+                    f':force_original_aspect_ratio=decrease,'
+                    f'pad={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:'
+                    f'(ow-iw)/2:(oh-ih)/2:black,'
+                    f'fps=30,setsar=1'
+                ),
+                '-c:v', 'libx264',
+                '-preset', 'ultrafast',
+                '-crf', '28',
+                '-an',          # strip clip audio — voiceover replaces it
+                norm_path,
+            ]
+            result = subprocess.run(norm_cmd, capture_output=True, text=True)
+            if result.returncode == 0 and os.path.exists(norm_path) and os.path.getsize(norm_path) > 1000:
+                clip_dur = get_media_duration(norm_path)
+                normalized_paths.append(norm_path)
+                normalized_durations.append(clip_dur)
+                print(f"[Assemble] Clip {i} normalized OK ({clip_dur:.1f}s)")
+            else:
+                print(f"[Assemble] Clip {i} normalization failed — skipping")
+                if result.stderr:
+                    print(f"[Assemble] Clip {i} stderr: {result.stderr[-400:]}")
+
+        if not normalized_paths:
+            raise RuntimeError("All clips failed to normalize — check Pexels downloads")
+
+        # ── Step 2: build concat list, looping clips until we cover audio ───
         concat_file = os.path.join(work_dir, 'concat.txt')
-        lines       = []
-        total       = 0.0
-        while total < duration * 2:
-            for path in clip_paths:
-                lines.append(f"file '{path}'")
-                total += 10   # rough ~10s per clip; FFMPEG cuts at audio end via -shortest
-                if total >= duration * 2:
-                    break
+        lines = []
+        total = 0.0
+        idx   = 0
+
+        while total < duration + 5:   # +5 s buffer so -shortest has room
+            p = normalized_paths[idx % len(normalized_paths)]
+            d = normalized_durations[idx % len(normalized_paths)]
+            lines.append(f"file '{p}'")
+            total += d
+            idx   += 1
+            if idx > 500:              # safety guard
+                break
 
         with open(concat_file, 'w') as f:
             f.write('\n'.join(lines))
 
-        # Single FFMPEG pass: concat clips → scale → mux voiceover → cut at audio end
-        cmd = [
+        print(f"[Assemble] Concat list: {idx} entries covering {total:.1f}s")
+
+        # ── Step 3: concat normalized clips into a silent video ─────────────
+        silent_video = os.path.join(work_dir, 'silent.mp4')
+        concat_cmd = [
             ffmpeg, '-y',
-            '-f', 'concat', '-safe', '0', '-i', concat_file,  # video input
-            '-i', audio_path,                                   # audio input
-            '-vf', (
-                f'scale={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}'
-                f':force_original_aspect_ratio=decrease,'
-                f'pad={OUTPUT_WIDTH}:{OUTPUT_HEIGHT}:'
-                f'(ow-iw)/2:(oh-ih)/2:black'
-            ),
-            '-c:v', 'libx264',
-            '-preset', 'ultrafast',
-            '-crf', '28',
+            '-f', 'concat', '-safe', '0', '-i', concat_file,
+            '-c:v', 'copy',     # safe: all clips are identical format now
+            silent_video,
+        ]
+        result = subprocess.run(concat_cmd, capture_output=True, text=True)
+        if result.returncode != 0:
+            print(f"[Assemble] Concat stderr: {result.stderr[-2000:]}")
+            raise RuntimeError(f"FFMPEG concat failed (code {result.returncode})")
+        print(f"[Assemble] Silent video assembled OK")
+
+        # ── Step 4: mux voiceover + trim to audio length ─────────────────────
+        mux_cmd = [
+            ffmpeg, '-y',
+            '-i', silent_video,
+            '-i', audio_path,
+            '-c:v', 'copy',
             '-c:a', 'aac',
             '-b:a', '128k',
             '-map', '0:v:0',
             '-map', '1:a:0',
-            '-shortest',          # cut output at end of audio
+            '-shortest',        # trim output at end of voiceover
             output_path,
         ]
-        print(f"[Assemble] Running FFMPEG ...")
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        result = subprocess.run(mux_cmd, capture_output=True, text=True)
         if result.returncode != 0:
-            print(f"[Assemble] FFMPEG stderr: {result.stderr[-2000:]}")
-            raise RuntimeError(f"FFMPEG failed (code {result.returncode})")
+            print(f"[Assemble] Mux stderr: {result.stderr[-2000:]}")
+            raise RuntimeError(f"FFMPEG mux failed (code {result.returncode})")
+
         print(f"[Assemble] Video encoded OK: {output_path}")
+
 
 def get_youtube_service():
     creds = Credentials(
@@ -150,23 +206,26 @@ def get_youtube_service():
     creds.refresh(Request())
     return build('youtube', 'v3', credentials=creds)
 
+
 def upload_to_youtube(video_path, title, description, tags):
     youtube = get_youtube_service()
     body = {
         'snippet': {
-            'title': title[:100],
-            'description': description,
-            'tags': tags if isinstance(tags, list) else tags.split(','),
-            'categoryId': '28',
+            'title':           title[:100],
+            'description':     description,
+            'tags':            tags if isinstance(tags, list) else tags.split(','),
+            'categoryId':      '28',
             'defaultLanguage': 'en',
         },
         'status': {
-            'privacyStatus': 'public',
+            'privacyStatus':           'public',
             'selfDeclaredMadeForKids': False,
-            'madeForKids': False,
+            'madeForKids':             False,
         },
     }
-    media = MediaFileUpload(video_path, mimetype='video/mp4', resumable=True, chunksize=10 * 1024 * 1024)
+    media = MediaFileUpload(
+        video_path, mimetype='video/mp4', resumable=True, chunksize=10 * 1024 * 1024
+    )
     insert_request = youtube.videos().insert(
         part=','.join(body.keys()),
         body=body,
@@ -179,8 +238,9 @@ def upload_to_youtube(video_path, title, description, tags):
             print(f"[YouTube] {int(status.progress() * 100)}% uploaded")
     return response['id']
 
+
 def build_video_worker(audio_bytes, audio_url, audio_base64, title, description, keywords, tags):
-    """Background thread: runs full pipeline after Make.com already got its 200 response."""
+    """Background thread: full pipeline after Make.com already got its 200 response."""
     import base64
     print(f"\n[Worker] Starting build: {title}")
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -215,7 +275,7 @@ def build_video_worker(audio_bytes, audio_url, audio_base64, title, description,
                 try:
                     download_file(clip['url'], path)
                     size = os.path.getsize(path)
-                    print(f"[Worker 3] Clip {i} OK ({size//1024}KB)")
+                    print(f"[Worker 3] Clip {i} OK ({size // 1024}KB)")
                     clip_paths.append(path)
                 except Exception as e:
                     print(f"[Worker 3] Clip {i} failed: {e}")
@@ -224,7 +284,7 @@ def build_video_worker(audio_bytes, audio_url, audio_base64, title, description,
                 print("[Worker] ERROR: All clip downloads failed")
                 return
 
-            # 4. Assemble (pure FFMPEG — no MoviePy for video reading)
+            # 4. Assemble (normalize-then-concat — avoids format-mismatch freeze)
             output_path = os.path.join(tmpdir, 'final_video.mp4')
             print("[Worker 4] Assembling video with FFMPEG...")
             assemble_video(audio_path, clip_paths, output_path)
@@ -240,9 +300,11 @@ def build_video_worker(audio_bytes, audio_url, audio_base64, title, description,
             print(f"[Worker] ERROR: {e}")
             traceback.print_exc()
 
+
 @app.route('/health', methods=['GET'])
 def health():
     return jsonify({'status': 'ok'})
+
 
 @app.route('/build-video', methods=['POST'])
 def build_video():
@@ -305,10 +367,11 @@ def build_video():
     ).start()
 
     return jsonify({
-        'status': 'processing',
+        'status':  'processing',
         'message': 'Video build started — uploading to YouTube in background',
-        'title': title,
+        'title':   title,
     }), 200
+
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
