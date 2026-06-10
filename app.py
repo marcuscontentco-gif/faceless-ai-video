@@ -489,6 +489,31 @@ def build_video():
         raw_kw       = request.form.get('keywords', '')
         raw_tags     = request.form.get('tags', '')
         raw_scenes   = request.form.get('scenes', '')
+
+        # ── claude_json: raw Claude response string — parse everything from it ──
+        # Make.com can't serialize arrays in form fields, so we pass the full
+        # raw JSON string from Claude and extract title/scenes/tags server-side.
+        claude_json_raw = request.form.get('claude_json', '')
+        if claude_json_raw:
+            try:
+                # Strip any preamble/postamble text around the JSON object
+                start = claude_json_raw.find('{')
+                end   = claude_json_raw.rfind('}') + 1
+                if start != -1 and end > start:
+                    claude_data = json.loads(claude_json_raw[start:end])
+                    title    = claude_data.get('title', title)
+                    if claude_data.get('tags'):
+                        raw_tags = json.dumps(claude_data['tags'])
+                    if claude_data.get('scenes'):
+                        raw_scenes = json.dumps(claude_data['scenes'])
+                    print(f"[Route] claude_json parsed OK — title={title[:60]}, "
+                          f"scenes={len(claude_data.get('scenes', []))}, "
+                          f"tags={len(claude_data.get('tags', []))}")
+                else:
+                    print(f"[Route] claude_json: no JSON object found")
+            except Exception as e:
+                print(f"[Route] claude_json parse failed: {e}")
+
         try:
             keywords = json.loads(raw_kw) if raw_kw.startswith('[') else [k.strip() for k in raw_kw.split(',') if k.strip()]
         except Exception:
@@ -500,7 +525,8 @@ def build_video():
         try:
             if raw_scenes:
                 scenes = json.loads(raw_scenes) if isinstance(raw_scenes, str) else raw_scenes
-        except Exception:
+        except Exception as e:
+            print(f"[Route] scenes parse failed: {e} — raw: {raw_scenes[:200]}")
             scenes = None
     else:
         data = request.get_json(force=True, silent=True)
