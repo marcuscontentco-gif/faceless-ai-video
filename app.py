@@ -13,15 +13,18 @@ from googleapiclient.http import MediaFileUpload
 
 app = Flask(__name__)
 
-# ── Environment Variables (set these in Railway dashboard) ────────────────────────────────
+# ── Environment Variables (set these in Railway dashboard) ────────────────────
 PEXELS_API_KEY        = os.environ.get('PEXELS_API_KEY')
 YOUTUBE_CLIENT_ID     = os.environ.get('YOUTUBE_CLIENT_ID')
 YOUTUBE_CLIENT_SECRET = os.environ.get('YOUTUBE_CLIENT_SECRET')
 YOUTUBE_REFRESH_TOKEN = os.environ.get('YOUTUBE_REFRESH_TOKEN')
-# ────────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
+# Output resolution — 720p keeps quality high while encoding 4-5x faster than 1080p
+OUTPUT_WIDTH  = 1280
+OUTPUT_HEIGHT = 720
 
-# ── Helpers ────────────────────────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def download_file(url, output_path):
     """Download any file from a URL and save it locally."""
@@ -31,34 +34,38 @@ def download_file(url, output_path):
         for chunk in response.iter_content(chunk_size=8192):
             f.write(chunk)
 
-
 def get_pexels_clips(keywords):
-    """Search Pexels and return a list of video clip metadata."""
+    """Search Pexels and return a list of video clip metadata.
+    
+    Uses up to 4 keywords with 5 results each (20 candidates total).
+    Prefers clips already at 1280px wide so no rescaling is needed.
+    """
     headers = {'Authorization': PEXELS_API_KEY}
     all_clips = []
 
-    for keyword in keywords[:6]:
+    for keyword in keywords[:4]:          # 4 keywords = good topic coverage
         keyword = keyword.strip()
         if not keyword:
             continue
 
         url = (
             f'https://api.pexels.com/videos/search'
-            f'?query={keyword}&per_page=8&orientation=landscape&size=medium'
+            f'?query={keyword}&per_page=5&orientation=landscape&size=medium'
         )
         try:
             resp = requests.get(url, headers=headers, timeout=30)
             data = resp.json()
 
             for video in data.get('videos', []):
-                # Prefer HD files
-                files = [f for f in video['video_files'] if f.get('width', 0) >= 1280]
-                if not files:
-                    files = video['video_files']
+                # Prefer files already at our target width (no resize needed)
+                exact = [f for f in video['video_files'] if f.get('width') == OUTPUT_WIDTH]
+                hd    = [f for f in video['video_files'] if f.get('width', 0) > OUTPUT_WIDTH]
+                sd    = [f for f in video['video_files'] if f.get('width', 0) >= 640]
+                files = exact or hd or sd or video['video_files']
                 if files:
-                    best = sorted(files, key=lambda x: x.get('width', 0), reverse=True)[0]
+                    best = sorted(files, key=lambda x: abs(x.get('width', 0) - OUTPUT_WIDTH))[0]
                     all_clips.append({
-                        'url': best['link'],
+                        'url':      best['link'],
                         'duration': video['duration'],
                     })
         except Exception as e:
@@ -66,16 +73,18 @@ def get_pexels_clips(keywords):
 
     return all_clips
 
-
 def assemble_video(audio_path, clip_paths, output_path):
-    """Stitch stock clips together under the voiceover and export an MP4."""
-    audio      = AudioFileClip(audio_path)
-    total_dur  = audio.duration
-    segments   = []
-    filled     = 0.0
-    idx        = 0
+    """Stitch stock clips together under the voiceover and export an MP4.
+    
+    Encodes at 720p with ultrafast preset — still great on YouTube, encodes
+    in ~60-90 s instead of 10+ minutes.
+    """
+    audio    = AudioFileClip(audio_path)
+    total_dur = audio.duration
+    segments = []
+    filled   = 0.0
+    idx      = 0
 
-    # Cycle through available clips until we fill the full audio duration
     while filled < total_dur and clip_paths:
         path = clip_paths[idx % len(clip_paths)]
         idx += 1
@@ -86,9 +95,9 @@ def assemble_video(audio_path, clip_paths, output_path):
             if clip.duration > remaining:
                 clip = clip.subclip(0, remaining)
 
-            # Standardise to 1920x1080
-            if clip.size != [1920, 1080]:
-                clip = clip.resize((1920, 1080))
+            # Standardise to OUTPUT resolution
+            if clip.size != [OUTPUT_WIDTH, OUTPUT_HEIGHT]:
+                clip = clip.resize((OUTPUT_WIDTH, OUTPUT_HEIGHT))
 
             segments.append(clip)
             filled += clip.duration
@@ -106,7 +115,7 @@ def assemble_video(audio_path, clip_paths, output_path):
         codec='libx264',
         audio_codec='aac',
         fps=24,
-        preset='fast',
+        preset='ultrafast',        # encodes ~5x faster; YouTube re-encodes anyway
         temp_audiofile=output_path.replace('.mp4', '_tmp.m4a'),
         remove_temp=True,
         verbose=False,
@@ -117,7 +126,6 @@ def assemble_video(audio_path, clip_paths, output_path):
         seg.close()
     audio.close()
     final.close()
-
 
 def get_youtube_service():
     """Return an authenticated YouTube API client using the stored refresh token."""
@@ -131,7 +139,6 @@ def get_youtube_service():
     )
     creds.refresh(Request())
     return build('youtube', 'v3', credentials=creds)
-
 
 def upload_to_youtube(video_path, title, description, tags):
     """Upload the finished MP4 to YouTube and return the video ID."""
@@ -173,14 +180,12 @@ def upload_to_youtube(video_path, title, description, tags):
 
     return response['id']
 
-
-# ── Routes ────────────────────────────────────────────────────────────────────────────
+# ── Routes ────────────────────────────────────────────────────────────────────
 
 @app.route('/health', methods=['GET'])
 def health():
-    """Quick check that the server is running -- call this first after deploying."""
+    """Quick check that the server is running."""
     return jsonify({'status': 'ok', 'message': 'Video builder is running'})
-
 
 @app.route('/build-video', methods=['POST'])
 def build_video():
@@ -191,9 +196,9 @@ def build_video():
     (A) Multipart/Form Data -- best for ElevenLabs binary output:
         audio       = <binary MP3 file field>
         title       = "Video title"
-        keywords    = "keyword1,keyword2,keyword3"   (comma-separated string)
+        keywords    = "keyword1,keyword2,keyword3"  (comma-separated)
         description = "..."
-        tags        = "tag1,tag2,tag3"               (comma-separated string)
+        tags        = "tag1,tag2,tag3"              (comma-separated)
 
     (B) JSON body with base64 audio:
         { "audio_base64": "<base64 MP3>", "title": "...", "keywords": [...], ... }
@@ -202,28 +207,22 @@ def build_video():
         { "audio_url": "<MP3 URL>", "title": "...", ... }
 
     Returns:
-    {
-        "status":      "success",
-        "video_id":    "<YouTube video ID>",
-        "youtube_url": "https://www.youtube.com/watch?v=...",
-        "duration":    92.4
-    }
+        { "status": "success", "video_id": "...", "youtube_url": "...", "duration": 92.4 }
     """
     import base64, json as _json
 
-    # ── Determine input source ────────────────────────────────────────────────────────────────────
-    content_type = request.content_type or ''
-    audio_file   = None
+    # ── Determine input source ────────────────────────────────────────────────
+    content_type  = request.content_type or ''
+    audio_file    = None
 
     if 'multipart/form-data' in content_type:
-        # (A) Multipart -- ElevenLabs binary sent as a file field named "audio"
-        audio_file   = request.files.get('audio')
-        audio_url    = request.form.get('audio_url')
-        audio_base64 = request.form.get('audio_base64')
-        title        = request.form.get('title', 'AI Tech Explained')
-        description  = request.form.get('description', '')
-        raw_kw   = request.form.get('keywords', '')
-        raw_tags = request.form.get('tags', '')
+        audio_file    = request.files.get('audio')
+        audio_url     = request.form.get('audio_url')
+        audio_base64  = request.form.get('audio_base64')
+        title         = request.form.get('title', 'AI Tech Explained')
+        description   = request.form.get('description', '')
+        raw_kw        = request.form.get('keywords', '')
+        raw_tags      = request.form.get('tags', '')
         try:
             keywords = _json.loads(raw_kw) if raw_kw.startswith('[') else [k.strip() for k in raw_kw.split(',') if k.strip()]
         except Exception:
@@ -233,7 +232,6 @@ def build_video():
         except Exception:
             tags = [t.strip() for t in raw_tags.split(',') if t.strip()]
     else:
-        # (B/C) JSON body
         data = request.get_json(force=True, silent=True)
         if not data:
             return jsonify({'error': 'No JSON body received'}), 400
@@ -247,22 +245,20 @@ def build_video():
     if not audio_file and not audio_url and not audio_base64:
         return jsonify({'error': 'Provide audio as a multipart file, audio_url, or audio_base64'}), 400
 
-    # Normalise keywords to a list
     if isinstance(keywords, str):
         keywords = [k.strip() for k in keywords.split(',')]
     if not keywords:
         keywords = ['technology', 'artificial intelligence', 'innovation']
 
-    # Normalise tags to a list
     if isinstance(tags, str):
         tags = [t.strip() for t in tags.split(',')]
 
-    print(f"\n[Build] Title: {title}")
+    print(f"\n[Build] Title:    {title}")
     print(f"[Build] Keywords: {keywords}")
 
     with tempfile.TemporaryDirectory() as tmpdir:
         try:
-            # 1. Get the ElevenLabs voiceover
+            # 1. Save / decode the voiceover
             audio_path = os.path.join(tmpdir, 'voiceover.mp3')
             if audio_file:
                 print("[Step 1] Saving uploaded audio file...")
@@ -272,9 +268,8 @@ def build_video():
                 b64 = audio_base64
                 if ',' in b64:
                     b64 = b64.split(',', 1)[1]
-                audio_bytes = base64.b64decode(b64)
                 with open(audio_path, 'wb') as f:
-                    f.write(audio_bytes)
+                    f.write(base64.b64decode(b64))
             else:
                 print("[Step 1] Downloading voiceover...")
                 download_file(audio_url, audio_path)
@@ -291,10 +286,10 @@ def build_video():
             if not clips_data:
                 return jsonify({'error': 'No Pexels clips found -- try different keywords'}), 500
 
-            # 4. Download clips (up to 12)
-            print(f"[Step 3] Downloading {min(len(clips_data), 12)} clips...")
+            # 4. Download clips (up to 8 — enough variety, faster than 12)
+            print(f"[Step 3] Downloading {min(len(clips_data), 8)} clips...")
             clip_paths = []
-            for i, clip in enumerate(clips_data[:12]):
+            for i, clip in enumerate(clips_data[:8]):
                 path = os.path.join(tmpdir, f'clip_{i:02d}.mp4')
                 try:
                     download_file(clip['url'], path)
@@ -306,7 +301,7 @@ def build_video():
                 return jsonify({'error': 'All clip downloads failed'}), 500
 
             # 5. Assemble the final video
-            print("[Step 4] Assembling video...")
+            print("[Step 4] Assembling video (720p ultrafast)...")
             output_path = os.path.join(tmpdir, 'final_video.mp4')
             assemble_video(audio_path, clip_paths, output_path)
 
@@ -328,8 +323,7 @@ def build_video():
             print(f"[Error] {str(e)}")
             return jsonify({'error': str(e)}), 500
 
-
-# ── Entry point ───────────────────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 5000))
